@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-chat-demo:latest
+    container_name: ai-chat-demo
+    ports:
+      - "8085:50505"   # maps host port 8080 -> container port 50505
+    restart: unless-stopped
+    env_file:
+      - .env                 # 👈 load all env vars from .env
+    environment:
+      - PYTHONUNBUFFERED=1   # you can still add extras here if needed
+    volumes:
+      - .:/code              # optional: mount source for live reload in dev
+    depends_on: []
