@@ -291,64 +291,346 @@ class SearchIndexManager:
         return new_index
         
 
-    async def build_embeddings_file(
-            self,
-            input_directory: str,
-            output_file: str,
-            sentences_per_embedding: int=4
-            ) -> None:
-        """
-        In this method we do lazy loading of nltk and download the needed data set to split
+async def build_embeddings_file(
+        self,
+        input_directory: str,
+        output_file: str,
+        sentences_per_embedding: int = 4
+) -> None:
+    """
+    Build embeddings from markdown (.md) or JSON files.
+    
+    Supports multiple JSON formats:
+    - Multi-chunk recipes (recipe_id, chunk_type)
+    - Nine Favorite Things (content, meta_json_string)
+    - Essentials (multiple recipes in one file)
+    - Weekly Meal Plan (meal plan by day)
+    
+    :param input_directory: The directory with .md or .json files.
+    :param output_file: The CSV file to store embeddings.
+    :param sentences_per_embedding: The number of sentences used to build embedding.
+    """
+    import nltk
+    try:
+        nltk.download('punkt', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+    except:
+        pass
 
-        document into tokens. This operation takes time that is why we hide import nltk under this
-        method. We also do not include nltk into requirements because this method is only used
-        during rag generation.
-        :param dimensions: The number of dimensions in the embeddings. Must be the same as
-               the one used for SearchIndexManager creation.
-        :param input_directory: The directory with the embedding files.
-        :param output_file: The file csv file to store embeddings.
-        :param embeddings_client: The embedding client, used to create embeddings. 
-                Must be the same as the one used for SearchIndexManager creation.
-        :param sentences_per_embedding: The number of sentences used to build embedding.
-        :param model: The embedding model to be used.
-        """
-        import nltk
-        nltk.download('punkt')
+    from nltk.tokenize import sent_tokenize
+
+    sentence_tokens = []
+
+    # Process both .md and .json files
+    md_files = glob.glob(input_directory + '/**/*.md', recursive=True)
+    json_files = glob.glob(input_directory + '/**/*.json', recursive=True)
+
+    all_files = md_files + json_files
+
+    if not all_files:
+        raise ValueError(f"No .md or .json files found in directory: {input_directory}")
+    
+    print(f"Found {len(md_files)} markdown files and {len(json_files)} JSON files.")
+
+    stats = {
+        'recipes': 0,
+        'favorites': 0,
+        'essentials': 0,
+        'meal_plans': 0,
+        'other': 0
+    }
+    index = 0
+
+    # Process Mardown files
+    for fle in md_files:
+        with open(fle, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if len(line) < SearchIndexManager.MIN_LINE_LENGTH or len(set(line)) < SearchIndexManager.MIN_DIFF_CHARACTERS_IN_LINE:
+                    continue
+                for sentence in sent_tokenize(line):
+                    if index % sentences_per_embedding ==0:
+                        sentence_tokens.append(sentence)
+                    else:
+                        sentence_tokens[-1] += ' '
+                        sentence_tokens[-1] += sentence
+                    index += 1
+
+    # Process JSON files
+    for file_num, fle in enumerate(json_files, 1):
+        if file_num % 100 == 0:
+            print(f"Processed {file_num}/{len(json_files)} JSON files...")
+
+        try:
+            with open(fle, encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Determine file type and process accordingly
+            file_type = self._detect_json_file_type(data)
+
+            if file_type == 'multi_chunk_recipes':
+                # Format 1: Multi-chunk recipes
+                stats['recipes'] += self._process_multi_chunk_recipes(data, sentence_tokens, sentences_per_embedding, sent_tokenize, index)
+
+            elif file_type == 'nine_favorites':
+                # Format 2: Nine Favorite Things
+                stats['favorites'] += 1
+                self._process_favorites(data, sentence_tokens, sentences_per_embedding, sent_tokenize, index)
+
+            elif file_type == 'essentials':
+                # Format 3: Essentials
+                stats['essentials'] += 1
+                self._process_essentials(data, sentence_tokens, sentences_per_embedding, sent_tokenize, index)
+
+            elif file_type == 'meal_plan':
+                # Format 4: Weekly Meal Plan
+                stats['meal_plans'] += 1
+                self._process_meal_plan(data, sentence_tokens, sentences_per_embedding, sent_tokenize, index)
+
+            else:
+                stats['other'] += 1
+                self._process_generic_json(data, sentence_tokens, sentences_per_embedding, sent_tokenize, index)
+
+        except json.JSONDecodeError as e:
+            print(f"Warning: Could not parse {fle}: {e}")
+            continue
+        except Exception as e:
+            print(f"Warning: Error processing {fle}: {e}")
+            continue
+    
+    if not sentence_tokens:
+        raise ValueError("No content extracted from files.")
+    
+    print(f"\nProcessing Summary:")
+    print(f" - Recipes: {stats['recipes']}")
+    print(f" - Nine Favorites: {stats['favorites']}")
+    print(f" - Essentials: {stats['essentials']}")
+    print(f" - Meal Plans: {stats['meal_plans']}")
+    print(f" - Other: {stats['other']}")
+    print(f" Total chunks: {len(sentence_tokens)}")
+
+    # Build embeddings in batches
+    batch_size = 2000
+    with open(output_file, 'w', newline='', encoding='utf-8') as fp:
+        writer = csv.DictWriter(fp, fieldnames=['token', 'embedding'])
+        writer.writeheader()
+
+        total_batches = (len(sentence_tokens) + batch_size -1) // batch_size
+        for batch_num, i in enumerate(range(0, len(sentence_tokens), batch_size), 1):
+            print(f"Creating embeddings batch {batch_num}/{total_batches}...")
+            batch_tokens = sentence_tokens[i:i+min(batch_size, len(sentence_tokens)-i)]
+
+            embedding = (await self._embeddings_client.embed(
+                input=batch_tokens,
+                dimensions=self._dimensions,
+                model=self._model  
+            ))["data"]
+
+            for token, float_data in zip(batch_tokens, embedding):
+                writer.writerow({'token': token, 'embedding': json.dumps(float_data['embedding'])})
         
-        from nltk.tokenize import sent_tokenize
-        # Split the data to sentence tokens.
-        sentence_tokens = []
-        globs = glob.glob(input_directory + '/*.md', recursive=True)
-        index = 0
-        for fle in globs:
-            with open(fle) as f:
-                for line in f:
-                    line = line.strip()
-                    # Skip non informative lines.
-                    if len(line) < SearchIndexManager.MIN_LINE_LENGTH or len(set(line)) < SearchIndexManager.MIN_DIFF_CHARACTERS_IN_LINE:
-                        continue
-                    for sentence in sent_tokenize(line):
-                        if index % sentences_per_embedding == 0:
-                            sentence_tokens.append(sentence)
-                        else:
-                            sentence_tokens[-1] += ' '
-                            sentence_tokens[-1] += sentence
-                        index += 1
+        print(f"\n Embeddings saved to {output_file}")
+
+def _detect_json_type(self, data):
+    """Detect which JSON format we're dealing with."""
+    if isinstance(data, list) and len(data) > 0:
+        first_item = data[0]
+        if isinstance(first_item, dict):
+            # Multi-chunk recipes have recipe_id and chunk_type
+            if 'recipe_id' in first_item and 'chunk_type' in first_item:
+                return 'multi_chunk_recipes'
+    
+    if isinstance(data, dict):
+        # Nine Favorites and others have 'content' and 'meta_json_string'
+        if 'content' in data and 'meta_json_string' in data:
+            try:
+                meta = json.loads(data['meta_json_string'])
+                section_type = meta.get('section_type', '')
+                
+                if section_type == 'nine_favorite_things':
+                    return 'nine_favorites'
+                elif section_type == 'essentials':
+                    return 'essentials'
+                elif section_type == 'weekly_meal_plan':
+                    return 'meal_plan'
+            except:
+                pass
+    
+    return 'unknown'
+
+def _process_multi_chunk_recipes(self, data, sentence_tokens, sentences_per_embedding, sent_tokenize, index):
+    """Process multi-chunk recipe format."""
+    recipes_by_id = {}
+    
+    for item in data:
+        if isinstance(item, dict):
+            recipe_id = item.get('recipe_id', item.get('id', 'unknown'))
+            if recipe_id not in recipes_by_id:
+                recipes_by_id[recipe_id] = []
+            recipes_by_id[recipe_id].append(item)
+    
+    for recipe_id, chunks in recipes_by_id.items():
+        chunks.sort(key=lambda x: x.get('order', 0))
+        recipe_text = ""
         
+        for chunk in chunks:
+            chunk_type = chunk.get('chunk_type', '')
+            chunk_content = chunk.get('chunk', '')
+            
+            if chunk_type == 'title':
+                recipe_text += f"Recipe: {chunk_content}. "
+            elif chunk_type in ['short_description', 'full_description']:
+                recipe_text += f"{chunk_content} "
+            elif chunk_type == 'ingredients':
+                ingredients = chunk_content.replace('Ingredients : ', '')
+                recipe_text += f"Ingredients: {ingredients}. "
+            elif chunk_type == 'instructions':
+                recipe_text += f"Instructions: {chunk_content} "
+            elif chunk_type == 'notes':
+                recipe_text += f"Notes: {chunk_content} "
+            
+            # Add metadata
+            if 'meta' in chunk and chunk['meta']:
+                meta = chunk['meta']
+                if meta.get('prep_time'):
+                    recipe_text += f"Prep time: {meta['prep_time']}. "
+                if meta.get('cook_time'):
+                    recipe_text += f"Cook time: {meta['cook_time']}. "
+                if meta.get('servings'):
+                    recipe_text += f"Serves: {meta['servings']}. "
+                if meta.get('cuisine'):
+                    recipe_text += f"Cuisine: {meta['cuisine']}. "
+                if meta.get('course'):
+                    recipe_text += f"Course: {meta['course']}. "
+            
+            if 'categories' in chunk and chunk['categories']:
+                categories = ', '.join(chunk['categories']) if isinstance(chunk['categories'], list) else chunk['categories']
+                recipe_text += f"Categories: {categories}. "
+            
+            if 'keywords' in chunk and chunk['keywords']:
+                keywords = ', '.join(chunk['keywords']) if isinstance(chunk['keywords'], list) else chunk['keywords']
+                recipe_text += f"Keywords: {keywords}. "
         
-        # For each token build the embedding, which will be used in the search.
-        batch_size = 2000
-        with open(output_file, 'w') as fp:
-            writer = csv.DictWriter(fp, fieldnames=['token', 'embedding'])
-            writer.writeheader()
-            for i in range(0, len(sentence_tokens), batch_size):
-                emedding = (await self._embeddings_client.embed(
-                    input=sentence_tokens[i:i+min(batch_size, len(sentence_tokens))],
-                    dimensions=self._dimensions,
-                    model=self._model
-                ))["data"]
-                for token, float_data in zip(sentence_tokens, emedding):
-                    writer.writerow({'token': token, 'embedding': json.dumps(float_data['embedding'])})
+        # Tokenize
+        recipe_text = recipe_text.strip()
+        if recipe_text:
+            sentences = sent_tokenize(recipe_text)
+            for sentence in sentences:
+                if len(sentence) >= SearchIndexManager.MIN_LINE_LENGTH:
+                    if index % sentences_per_embedding == 0:
+                        sentence_tokens.append(sentence)
+                    else:
+                        sentence_tokens[-1] += ' '
+                        sentence_tokens[-1] += sentence
+                    index += 1
+    
+    return len(recipes_by_id)
+
+def _process_favorites(self, data, sentence_tokens, sentences_per_embedding, sent_tokenize, index):
+    """Process Nine Favorite Things format."""
+    content = data.get('content', '')
+    
+    # Parse metadata
+    try:
+        meta = json.loads(data.get('meta_json_string', '{}'))
+        title = meta.get('title', 'Nine Favorite Things')
+        author = meta.get('Author', '')
+        published = meta.get('published_date', '')
+        
+        text = f"{title}. "
+        if author:
+            text += f"By {author}. "
+        if published:
+            text += f"Published: {published}. "
+        text += content
+    except:
+        text = content
+    
+    # Tokenize
+    if text:
+        sentences = sent_tokenize(text)
+        for sentence in sentences:
+            if len(sentence) >= SearchIndexManager.MIN_LINE_LENGTH:
+                if index % sentences_per_embedding == 0:
+                    sentence_tokens.append(sentence)
+                else:
+                    sentence_tokens[-1] += ' '
+                    sentence_tokens[-1] += sentence
+                index += 1
+
+def _process_essentials(self, data, sentence_tokens, sentences_per_embedding, sent_tokenize, index):
+    """Process Essentials format (multiple recipes in one file)."""
+    content = data.get('content', '')
+    
+    # Parse metadata for context
+    try:
+        meta = json.loads(data.get('meta_json_string', '{}'))
+        section_type = meta.get('section_type', 'Essentials')
+        
+        # Extract title/description from content
+        lines = content.split('\n')
+        processed_text = f"Essential Recipes: {section_type}. {content}"
+    except:
+        processed_text = content
+    
+    # Tokenize
+    if processed_text:
+        sentences = sent_tokenize(processed_text)
+        for sentence in sentences:
+            if len(sentence) >= SearchIndexManager.MIN_LINE_LENGTH:
+                if index % sentences_per_embedding == 0:
+                    sentence_tokens.append(sentence)
+                else:
+                    sentence_tokens[-1] += ' '
+                    sentence_tokens[-1] += sentence
+                index += 1
+
+def _process_meal_plan(self, data, sentence_tokens, sentences_per_embedding, sent_tokenize, index):
+    """Process Weekly Meal Plan format."""
+    content = data.get('content', '')
+    
+    # Parse metadata
+    try:
+        meta = json.loads(data.get('meta_json_string', '{}'))
+        date = meta.get('date', '')
+        
+        text = f"Weekly Meal Plan for {date}. {content}"
+    except:
+        text = content
+    
+    # Tokenize
+    if text:
+        sentences = sent_tokenize(text)
+        for sentence in sentences:
+            if len(sentence) >= SearchIndexManager.MIN_LINE_LENGTH:
+                if index % sentences_per_embedding == 0:
+                    sentence_tokens.append(sentence)
+                else:
+                    sentence_tokens[-1] += ' '
+                    sentence_tokens[-1] += sentence
+                index += 1
+
+def _process_generic_json(self, data, sentence_tokens, sentences_per_embedding, sent_tokenize, index):
+    """Fallback for unknown JSON formats."""
+    text_content = ""
+    
+    if isinstance(data, dict):
+        for key in ['title', 'name', 'content', 'text', 'description']:
+            if key in data:
+                text_content += str(data[key]) + " "
+    elif isinstance(data, str):
+        text_content = data
+    
+    if text_content:
+        sentences = sent_tokenize(text_content)
+        for sentence in sentences:
+            if len(sentence) >= SearchIndexManager.MIN_LINE_LENGTH:
+                if index % sentences_per_embedding == 0:
+                    sentence_tokens.append(sentence)
+                else:
+                    sentence_tokens[-1] += ' '
+                    sentence_tokens[-1] += sentence
+                index += 1
 
     async def close(self):
         """Close the closeable resources, associated with SearchIndexManager."""
