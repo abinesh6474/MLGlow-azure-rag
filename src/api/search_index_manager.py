@@ -295,7 +295,8 @@ async def build_embeddings_file(
         self,
         input_directory: str,
         output_file: str,
-        sentences_per_embedding: int = 4
+        sentences_per_embedding: int = 4,
+        include_subdirs: bool = False ## new parameter (sub_dirs)
 ) -> None:
     """
     Build embeddings from markdown (.md) or JSON files.
@@ -322,9 +323,21 @@ async def build_embeddings_file(
     sentence_tokens = []
 
     # Process both .md and .json files
-    md_files = glob.glob(input_directory + '/**/*.md', recursive=True)
-    json_files = glob.glob(input_directory + '/**/*.json', recursive=True)
+    # conditional glob pattern based on flag
+    if include_subdirs:
+        # search subdirectories recursively
+        md_pattern = input_directory + '/**/*.md'
+        json_pattern = input_directory + '/**/*.json'
+        print(f"Searching directories and all subdirectories: {input_directory}")
+    else:
+        # Search only top level directory
+        md_pattern = input_directory + '/*.md'
+        json_pattern = input_directory + '/*.json'
+        print(f"Searching only top level directory: {input_directory}")
 
+    md_files = glob.glob(md_pattern, recursive=include_subdirs)
+    json_files = glob.glob(json_pattern, recursive=include_subdirs)
+    
     all_files = md_files + json_files
 
     if not all_files:
